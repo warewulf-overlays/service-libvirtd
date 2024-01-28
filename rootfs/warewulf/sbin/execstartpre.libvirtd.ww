@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+# Author: griznog
+# Purpose:
+#    * Control startup of libvirtd based on node tags.
+#    * Optionally configure SR-IOV on Mellanox ConnectX-N interfaces
+
+import os, sys, os.path, subprocess
+import json
+from pprint import pprint as pprint
+
+def allow_service_start():
+{{ if eq .Tags.ovl_libvirtd_service_enable "true" -}}
+    # Enabled via .Tags.ovl_libvirtd_enable
+    return True
+{{- else -}}
+    # Disabled via .Tags.ovl_libvirtd_enable or by default.
+    return False
+{{- end }}
+
+def allow_sriov_setup():
+{{ if eq .Tags.ovl_libvirtd_sriov_setup "true" -}}
+    # Enabled via .Tags.ovl_libvirtd_sriov_setup
+    return True
+{{- else -}}
+    # Disabled via .Tags.ovl_libvirtd_sriov_setup or by default.
+    return False
+{{- end }}
+
+
+###################################################################################
+# Grab the output of `ip link` for the given device.
+def ip_link(dev):
+    status, output = subprocess.getstatusoutput('ip --json link show dev %s' % dev)
+    return json.loads(output)
+
+###################################################################################
+# Grab the output of `ip addr` for the given device. 
+def ip_addr(dev):
+    status, output = subprocess.getstatusoutput('ip --json addr show dev %s' % dev)
+    return json.loads(output)
+
+###################################################################################
+# Collect all enabled SR-IOV network devices. Enabled is defined as 
+# having sriov_totalvfs > 0. Return a dict with all the devices and 
+# useful info about them for setting up the VFs on each.
+def sriov_pfs():
+    all_devs = os.listdir('/sys/class/net')
+    sriov_pfs = {}
+    for dev in all_devs:
+        # Paths where we can find stuff we need. Seems like this could be a 
+        # little more elegant, but OFED vs. MOFED vs kernel .... this is more 
+        # dynamic than one would like. 
+        dev_info_path = '/sys/class/net/%s/device' % dev
+        sriov_totalvfs_path = os.path.join(dev_info_path, 'sriov_totalvfs')
+        sriov_numvfs_path = os.path.join(dev_info_path, 'sriov_numvfs')
+        vpi_path = os.path.join(dev_info_path, 'infiniband')
+
+        if os.path.exists(sriov_totalvfs_path):
+            # Get total number of VFs setting.
+            with open(sriov_totalvfs_path, 'r') as f:
+                sriov_totalvfs = int(f.read().strip())
+            # Get current configured VFs count.
+            if os.path.exists(sriov_numvfs_path):
+                with open(sriov_numvfs_path, 'r') as f:
+                    sriov_numvfs = int(f.read().strip())
+
+            # Check if this is a Mellanox/nVidia VPI card.
+            if os.path.exists(vpi_path):
+                vpi = True
+                mlx5_id = os.listdir(vpi_path)[0]
+            else:
+                vpi = False
+                mlx5_id = None
+
+            ip_link_info = ip_link(dev)
+            ifname = ip_link_info[0]['ifname']
+            link_type = ip_link_info[0]['link_type']
+            address = ip_link_info[0]['address']
+
+            # If configured for SR-IOV, add to our dict of interfaces.
+            if sriov_totalvfs > 0:
+                # Seed the entry with what we know so far.
+                sriov_pfs[dev] = { 'ifname' : ifname,
+                                   'device' : dev,
+                                   'sriov_totalvfs' : sriov_totalvfs,
+                                   'sriov_numvfs' : sriov_numvfs,
+                                   'link_type' : link_type,
+                                   'vpi' : vpi,
+                                   'mlx5_id' : mlx5_id,
+                                   'address' : address 
+                                 }
+
+                if link_type == 'infiniband':
+                    node_guid_path = os.path.join(vpi_path, mlx5_id, 'node_guid')
+                    if os.path.exists(node_guid_path):
+                        with open(node_guid_path, 'r') as f:
+                            node_guid = f.read().strip()
+                            sriov_pfs[dev]['node_guid'] = node_guid
+                    else:
+                        sriov_pfs[dev]['node_guid'] = None
+
+    return sriov_pfs
+
+###################################################################################
+# This function takes a device entry from the dict returned by the sriov_pfs() 
+# function. We do this one-by-one because we may want to make setting these up 
+# conditional based on WW node tag info.
+#
+# Enables all VFs on an infinband device and sets the node/port GUID based
+# on a subset of the physical device's node GUID. It also sets the link state 
+# to auto, so the VFs will follow the state of the PF device.
+def enable_infiniband_vfs(dev):
+    device = dev['device']
+    device_sys_path = '/sys/class/net/%s/device' % device
+
+    # Enable the VFs
+    with open(os.path.join(device_sys_path, 'sriov_numvfs'), 'w') as f:
+        f.write("%d\n" % dev['sriov_totalvfs'])
+  
+    # The physical address looks something like this:
+    #   '00:00:10:49:fe:80:00:00:00:00:00:00:e8:eb:d3:XX:XX:89:b4:be'
+    # With the last 8 octets being == the node GUID. Of those last 8, 2 octets
+    # are effectively meaningless (see XX:XX in the example), they show up as
+    # just a handful of values repeated across a lot of adapters. We will
+    # remove those to get a 6 octet prefix, then add our own octets to 
+    # create unique node and port guid values.
+    vf_guid_prefix = dev['address'].split(':')[-8:-5] + dev['address'].split(':')[-3:]
+
+    # Configure port and node GUID values using our templates.
+    for vf_id in range(0, dev['sriov_totalvfs']):
+        vf_node_guid = vf_guid_prefix + [ 'ab', '%02d' % vf_id ]
+        vf_port_guid = vf_guid_prefix + [ 'ba', '%02d' % vf_id ]
+        status, output = subprocess.getstatusoutput('ip link set dev %s vf %d node_guid %s' % (device, vf_id, ':'.join(vf_node_guid)))
+        status, output = subprocess.getstatusoutput('ip link set dev %s vf %d port_guid %s' % (device, vf_id, ':'.join(vf_port_guid)))
+        status, output = subprocess.getstatusoutput('ip link set dev %s vf %d state auto' % (device, vf_id))
+
+###################################################################################
+# This function takes a device entry from the dict returned by the sriov_pfs()
+# function. We do this one-by-one because we may want to make setting these up 
+# conditional based on WW node tag info.
+#
+# Enable VFs on an ethernet device. Note that if you do not set the 
+# MAC manually for these then each time a VM reboots it will generate 
+# a random MAC (at least Windows VMs, I didn't test on Linux (yet))
+def enable_ethernet_vfs(dev):
+    sriov_totalvfs = dev['sriov_totalvfs']
+    device = dev['device']
+    sriov_numvfs_path = '/sys/class/net/%s/device/sriov_numvfs' % device
+    with open(sriov_numvfs_path, 'w') as f:
+        f.write("%d\n" % sriov_totalvfs)
+    vf_mac_prefix = ['fa', 'ce'] + dev['address'].split(':')[-3:]
+    for vf_id in range(0, dev['sriov_totalvfs']):
+        vf_mac = vf_mac_prefix + [ '%02d' % vf_id ]
+        status, output = subprocess.getstatusoutput('ip link set dev %s vf %s mac %s' % (device, vf_id, ':'.join(vf_mac)))
+
+
+if __name__ == '__main__':
+    if not allow_service_start():
+        sys.exit(1)
+
+    if not allow_sriov_setup():
+        sys.exit(0)
+ 
+    # If we get to here, configure all SR-IOV VFs we can find.
+    devices = sriov_pfs()
+    for device in devices.keys():
+        dev = devices[device]
+        if dev['sriov_totalvfs'] > 0:
+            if dev['link_type'] == 'infiniband':
+                enable_infiniband_vfs(dev)
+            elif dev['link_type'] == 'ether':
+                enable_ethernet_vfs(dev)
+            else:
+                print("Unknown link type for %s" % device)
+                pprint(dev)
+
+
